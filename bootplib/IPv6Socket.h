@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013 Apple Inc. All rights reserved.
+ * Copyright (c) 2013-2018 Apple Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  * 
@@ -43,15 +43,5 @@
 int
 IPv6SocketSend(int sockfd, int ifindex, const struct sockaddr_in6 * dest,
 	       const void * pkt, int pkt_size, int hlim);
-
-int
-ICMPv6SocketOpen(bool receive_too);
-
-int
-ICMPv6SocketSendNeighborAdvertisement(int sockfd,
-				      int if_index,
-				      const void * link_addr,
-				      int link_addr_length,
-				      const struct in6_addr * target_ipaddr);
 
 #endif /* _S_IPV6SOCKET_H */

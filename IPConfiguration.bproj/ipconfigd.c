@@ -182,11 +182,11 @@
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #include <TargetConditionals.h>
 #include <Availability.h>
-#if ! TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
 #include <CoreFoundation/CFUserNotification.h>
 #include <CoreFoundation/CFUserNotificationPriv.h>
 #include <IOKit/pwr_mgt/IOPMLibPrivate.h>
-#endif /* ! TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
 
 #include "rfc_options.h"
 #include "dhcp_options.h"
@@ -215,7 +215,7 @@
 #include "IPConfigurationServiceInternal.h"
 #include "IPConfigurationControlPrefs.h"
 #include "CGA.h"
-#include "IPv6Socket.h"
+#include "ICMPv6Socket.h"
 #include "report_symptoms.h"
 #include "bootp_transmit.h"
 
@@ -256,6 +256,7 @@ typedef struct {
 
 typedef struct {
     inet6_addr_prefix_t		requested_ip;
+    boolean_t			enable_clat46;
 } ServiceIPv6, * ServiceIPv6Ref;
 
 struct ServiceInfo {
@@ -271,10 +272,10 @@ struct ServiceInfo {
     CFStringRef			child_serviceID;
     dispatch_source_t		pid_source;
     void * 			private;
-#if ! TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
     CFUserNotificationRef	user_notification;
     CFRunLoopSourceRef		user_rls;
-#endif /* ! TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
     union {
 	ServiceIPv4		v4;
 	ServiceIPv6		v6;
@@ -307,7 +308,6 @@ struct IFState {
     uint32_t			wake_generation;
     boolean_t			disable_perform_nud;
     boolean_t			disable_dad;
-    boolean_t			enable_clat46;
     boolean_t			nat64_prefix_available;
     boolean_t			plat_discovery_complete;
     struct in6_addr		ipv6_linklocal;
@@ -577,10 +577,10 @@ static struct in_addr		S_netboot_server_ip;
 static char			S_netboot_ifname[IFNAMSIZ + 1];
 
 static boolean_t		S_awake = TRUE;
-#if ! TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
 static boolean_t		S_use_maintenance_wake = TRUE;
 static boolean_t		S_wake_event_sent;
-#endif /* ! TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
 static uint32_t			S_wake_generation;
 static absolute_time_t		S_wake_time;
 
@@ -1595,9 +1595,9 @@ ServiceFree(void * arg)
     }
     config_method_stop(service_p);
     service_publish_clear(service_p);
-#if ! TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
     ServiceRemoveAddressConflict(service_p);
-#endif /* ! TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
     my_CFRelease(&service_p->serviceID);
     my_CFRelease(&service_p->parent_serviceID);
     my_CFRelease(&service_p->child_serviceID);
@@ -1982,6 +1982,8 @@ S_FreeNonDynamicServices(dynarray_t * services_p)
 static void
 IFStateFreeIPv4Services(IFStateRef ifstate, boolean_t all)
 {
+    int		count = dynarray_count(&ifstate->services);
+
     if (all) {
 	dynarray_free(&ifstate->services);
     }
@@ -1989,7 +1991,8 @@ IFStateFreeIPv4Services(IFStateRef ifstate, boolean_t all)
 	S_FreeNonDynamicServices(&ifstate->services);
     }
     ifstate->startup_ready = TRUE;
-    if (dynarray_count(&ifstate->services) == 0
+    if (count != 0
+	&& dynarray_count(&ifstate->services) == 0
 	&& if_ift_type(ifstate->if_p) != IFT_STF) {
 	inet_detach_interface(if_name(ifstate->if_p));
     }
@@ -1999,13 +2002,17 @@ IFStateFreeIPv4Services(IFStateRef ifstate, boolean_t all)
 static void
 IFStateFreeIPv6Services(IFStateRef ifstate, boolean_t all)
 {
+    int		count = dynarray_count(&ifstate->services_v6);
+
     if (all) {
 	dynarray_free(&ifstate->services_v6);
     }
     else {
 	S_FreeNonDynamicServices(&ifstate->services_v6);
     }
-    IFState_detach_IPv6(ifstate);
+    if (count != 0) {
+	IFState_detach_IPv6(ifstate);
+    }
     return;
 }
 
@@ -2149,7 +2156,6 @@ IFState_update_media_status(IFStateRef ifstate)
 	CFStringRef		ssid;
 
 	ssid = S_copy_ssid_bssid(ifstate, &bssid);
-
 	/* remember the ssid */
 	IFState_set_ssid_bssid(ifstate, ssid, &bssid);
 	my_CFRelease(&ssid);
@@ -2231,6 +2237,9 @@ IFState_set_ssid_bssid(IFStateRef ifstate, CFStringRef ssid,
 	CFRelease(ifstate->ssid);
     }
     ifstate->ssid = ssid;
+    if (ssid == NULL) {
+	bssid = NULL;
+    }
     IFState_set_bssid(ifstate, bssid);
     return;
 }
@@ -2326,8 +2335,7 @@ IFState_attach_IPv6(IFStateRef ifstate)
 	    (void)inet6_linklocal_start(if_name(if_p), ipv6_ll,
 					!ifstate->disable_perform_nud,
 					use_cga,
-					!ifstate->disable_dad,
-					ifstate->enable_clat46);
+					!ifstate->disable_dad);
 	    started = TRUE;
 	}
     }
@@ -2409,11 +2417,11 @@ IFStateGetDisableUntilNeededRequested(IFStateRef ifstate)
 	if (dun_p->prefs_set) {
 	    requested = dun_p->prefs_requested;
 	}
-#if ! TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
 	else {
 	    requested = if_is_tethered(ifstate->if_p);
 	}
-#endif /* ! TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
     }
     return (requested);
 }
@@ -2436,9 +2444,9 @@ IFStateSetDisableUntilNeededRequested(IFStateRef ifstate,
     }
     else {
 	dun_p->prefs_set = FALSE;
-#if ! TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
 	requested = if_is_tethered(ifstate->if_p);
-#endif /* ! TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
     }
     if (requested != old_requested) {
 	/* disable until needed request changed */
@@ -2749,10 +2757,10 @@ service_publish_clear(ServiceRef service_p)
 			 kSCEntNetDNS, dns_dict, &entity_count);
 	set_entity_value(entities, values, N_PUBLISH_ENTITIES,
 			 kSCEntNetDHCP, NULL, &entity_count);
-#if ! TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
 	set_entity_value(entities, values, N_PUBLISH_ENTITIES,
 			 kSCEntNetSMB, NULL, &entity_count);
-#endif /* ! TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
 	ServiceSetActiveDuringSleepNeedsAttention(service_p);
     }
     else {
@@ -3012,19 +3020,6 @@ service_scrub_old_ipv4_addresses(ServiceRef service_p)
     }
 }
 
-static void
-my_CFDictionarySetIPAddressAsString(CFMutableDictionaryRef dict,
-				    CFStringRef prop,
-				    struct in_addr ip_addr)
-{
-    CFStringRef		str;
-
-    str = my_CFStringCreateWithIPAddress(ip_addr);
-    CFDictionarySetValue(dict, prop, str);
-    CFRelease(str);
-    return;
-}
-
 PRIVATE_EXTERN void
 ServicePublishSuccessIPv4(ServiceRef service_p, dhcp_info_t * dhcp_info_p)
 {
@@ -3041,13 +3036,13 @@ ServicePublishSuccessIPv4(ServiceRef service_p, dhcp_info_t * dhcp_info_p)
     IPv4ClasslessRouteRef	routes = NULL;
     int				routes_count = 0;
     CFStringRef			serviceID;
-#if ! TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
     CFMutableDictionaryRef	smb_dict = NULL;
     const uint8_t *		smb_nodetype = NULL;
     int				smb_nodetype_len = 0;
     struct in_addr *		smb_server = NULL;
     int				smb_server_len = 0;
-#endif /* ! TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
     CFDictionaryRef		values[N_PUBLISH_ENTITIES];
 
     if (service_p->serviceID == NULL) {
@@ -3197,7 +3192,7 @@ ServicePublishSuccessIPv4(ServiceRef service_p, dhcp_info_t * dhcp_info_p)
     set_entity_value(entities, values, N_PUBLISH_ENTITIES,
 		     kSCEntNetDNS, dns_dict, &entity_count);
 
-#if ! TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
     /* SMB */
     if (options != NULL) {
 	if (dhcp_parameter_is_ok(dhcptag_nb_over_tcpip_name_server_e)) {
@@ -3258,7 +3253,7 @@ ServicePublishSuccessIPv4(ServiceRef service_p, dhcp_info_t * dhcp_info_p)
     }
     set_entity_value(entities, values, N_PUBLISH_ENTITIES,
 		     kSCEntNetSMB, smb_dict, &entity_count);
-#endif /* ! TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
     
     /* DHCP */
     if (dhcp_info_p != NULL && dhcp_info_p->pkt_size != 0) {
@@ -3277,9 +3272,9 @@ ServicePublishSuccessIPv4(ServiceRef service_p, dhcp_info_t * dhcp_info_p)
     my_CFRelease(&ipv4_dict);
     my_CFRelease(&dns_dict);
     my_CFRelease(&dhcp_dict);
-#if ! TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
     my_CFRelease(&smb_dict);
-#endif /* ! TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
     all_services_ready();
     ServiceSetActiveDuringSleepNeedsAttention(service_p);
     setDisableUntilNeededNeedsAttention();
@@ -3448,32 +3443,6 @@ ServiceIPv6CopyMergedDNS(ServiceRef service_p, dhcpv6_info_t * info_v6_p)
     return (DNSEntityCreateWithDHCPv4AndDHCPv6Info(&info, info_v6_p));
 }
 
-STATIC CFDictionaryRef
-IPv4CLAT46DictionaryCopy(IFStateRef ifstate, struct in_addr clat46_address)
-{
-    CFMutableDictionaryRef	ipv4_dict = NULL;
-
-    ipv4_dict = CFDictionaryCreateMutable(NULL, 0,
-					  &kCFTypeDictionaryKeyCallBacks,
-					  &kCFTypeDictionaryValueCallBacks);
-    /* Addresses */
-    my_CFDictionarySetIPAddressAsArrayValue(ipv4_dict,
-					    kSCPropNetIPv4Addresses,
-					    clat46_address);
-    /* Router */
-    my_CFDictionarySetIPAddressAsString(ipv4_dict,
-					kSCPropNetIPv4Router,
-					clat46_address);
-
-    /* InterfaceName */
-    CFDictionarySetValue(ipv4_dict, kSCPropInterfaceName, ifstate->ifname);
-
-    /* CLAT46 */
-    CFDictionarySetValue(ipv4_dict, kSCPropNetIPv4CLAT46, kCFBooleanTrue);
-
-    return (ipv4_dict);
-}
-
 PRIVATE_EXTERN void
 ServicePublishSuccessIPv6(ServiceRef service_p,
 			  inet6_addrinfo_t * addresses, int addresses_count,
@@ -3483,7 +3452,7 @@ ServicePublishSuccessIPv6(ServiceRef service_p,
 {
     CFStringRef			entities[N_PUBLISH_ENTITIES];
     int				entity_count;
-    boolean_t			clat46_active = FALSE;
+    const char *		extra_string;
     CFDictionaryRef		dhcp_dict = NULL;
     CFDictionaryRef		dns_dict = NULL;
     interface_t *		if_p = service_interface(service_p);
@@ -3491,6 +3460,7 @@ ServicePublishSuccessIPv6(ServiceRef service_p,
     CFDictionaryRef		ipv4_dict = NULL;
     CFMutableDictionaryRef	ipv6_dict = NULL;
     DHCPv6OptionListRef		options = NULL;
+    boolean_t			perform_plat_discovery = FALSE;
     CFDictionaryRef		values[N_PUBLISH_ENTITIES];
 
     if (service_p->serviceID == NULL) {
@@ -3509,6 +3479,8 @@ ServicePublishSuccessIPv6(ServiceRef service_p,
 
     if (dhcp_info_p != NULL) {
 	options = dhcp_info_p->options;
+	ipv4_dict = dhcp_info_p->ipv4_dict;
+	perform_plat_discovery = dhcp_info_p->perform_plat_discovery;
     }
 
     /* IPv6 */
@@ -3539,6 +3511,11 @@ ServicePublishSuccessIPv6(ServiceRef service_p,
 				 signature);
 	}
     }
+    /* PerformPLATDiscovery */
+    if (perform_plat_discovery) {
+	CFDictionarySetValue(ipv6_dict, kSCPropNetIPv6PerformPLATDiscovery,
+			     kCFBooleanTrue);
+    }
 
     /* DNS */
     dns_dict = ServiceIPv6CopyMergedDNS(service_p, dhcp_info_p);
@@ -3546,34 +3523,6 @@ ServicePublishSuccessIPv6(ServiceRef service_p,
     /* DHCPv6 */
     if (options != NULL) {
 	dhcp_dict = DHCPv6InfoDictionaryCreate(options);
-    }
-
-    /* CLAT46 */
-    if (ifstate->enable_clat46) {
-	/* PLAT discovery */
-	if (ipconfig_method_routable(service_p->method)) {
-	    CFDictionarySetValue(ipv6_dict, kSCPropNetIPv6PerformPLATDiscovery,
-				 kCFBooleanTrue);
-	}
-	else {
-	    my_log(LOG_NOTICE,
-		   "%s %s: CLAT46 enabled but not routable",
-		   ipconfig_method_string(service_p->method),
-		   if_name(ifstate->if_p));
-	}
-
-	/* IPv4 */
-	if (dhcp_info_p != NULL
-	    && dhcp_info_p->clat46_address.s_addr != 0) {
-	    my_log(LOG_NOTICE,
-		   "%s %s: CLAT46 address " IP_FORMAT,
-		   ipconfig_method_string(service_p->method),
-		   if_name(ifstate->if_p),
-		   IP_LIST(&dhcp_info_p->clat46_address));
-	    ipv4_dict = IPv4CLAT46DictionaryCopy(ifstate,
-						 dhcp_info_p->clat46_address);
-	    clat46_active = TRUE;
-	}
     }
 
     /*
@@ -3596,7 +3545,6 @@ ServicePublishSuccessIPv6(ServiceRef service_p,
 				entities, values, entity_count,
 				service_p->no_publish);
     my_CFRelease(&ipv6_dict);
-    my_CFRelease(&ipv4_dict);
     my_CFRelease(&dns_dict);
     my_CFRelease(&dhcp_dict);
     setDisableUntilNeededNeedsAttention();
@@ -3609,11 +3557,20 @@ ServicePublishSuccessIPv6(ServiceRef service_p,
 	       ipconfig_method_string(service_p->method),
 	       if_name(ifstate->if_p));
     }
+    if (ipv4_dict != NULL) {
+	extra_string = " [464XLAT]";
+    }
+    else if (perform_plat_discovery) {
+	extra_string = " [PLATDiscovery]";
+    }
+    else {
+	extra_string = "";
+    }
     my_log(LOG_NOTICE,
 	   "%s %s: publish success%s",
 	   ipconfig_method_string(service_p->method),
 	   if_name(ifstate->if_p),
-	   clat46_active ? " w/clat46" : "");
+	   extra_string);
     return;
 }
 
@@ -4062,10 +4019,9 @@ service_set_address(ServiceRef service_p,
 	}
     }
     if (broadcast.s_addr == 0) {
-	broadcast = hltoip(iptohl(addr) | ~iptohl(mask));
+	broadcast.s_addr = addr.s_addr | ~mask.s_addr;
     }
-    netaddr = hltoip(iptohl(addr) & iptohl(mask));
-
+    netaddr.s_addr = addr.s_addr & mask.s_addr;
     my_log(LOG_NOTICE,
 	   "%s %s: setting " IP_FORMAT " netmask " IP_FORMAT 
 	   " broadcast " IP_FORMAT, 
@@ -4165,13 +4121,23 @@ service_remove_address(ServiceRef service_p)
     return (ret);
 }
 
+STATIC void
+service_enable_clat46(ServiceRef service_p)
+{
+    if (!ServiceIsIPv6(service_p)) {
+	return;
+    }
+    service_p->u.v6.enable_clat46 = TRUE;
+    return;
+}
+
 PRIVATE_EXTERN boolean_t
 service_clat46_is_enabled(ServiceRef service_p)
 {
-    IFStateRef		ifstate;
-
-    ifstate = service_ifstate(service_p);
-    return (ifstate->enable_clat46);
+    if (!ServiceIsIPv6(service_p)) {
+	return (FALSE);
+    }
+    return (service_p->u.v6.enable_clat46);
 }
 
 PRIVATE_EXTERN boolean_t
@@ -4191,81 +4157,6 @@ service_plat_discovery_failed(ServiceRef service_p)
     ifstate = service_ifstate(service_p);
     return (ifstate->plat_discovery_complete
 	    && !ifstate->nat64_prefix_available);
-}
-
-PRIVATE_EXTERN int
-service_clat46_set_address(ServiceRef service_p, struct in_addr addr)
-{
-    struct in_addr	dest;
-    interface_t *	if_p = service_interface(service_p);
-    struct in_addr	mask;
-    int			ret = 0;
-    int 		s = inet_dgram_socket();
-
-    dest.s_addr = addr.s_addr;
-    mask.s_addr = INADDR_BROADCAST;
-
-    my_log(LOG_NOTICE,
-	   "%s %s: setting " IP_FORMAT " dest " IP_FORMAT,
-	   ServiceGetMethodString(service_p),
-	   if_name(if_p),
-	   IP_LIST(&addr), IP_LIST(&dest));
-    if (s < 0) {
-	ret = errno;
-	my_log(LOG_ERR,
-	       "service_clat46_set_address(%s): socket() failed, %s (%d)",
-	       if_name(if_p), strerror(errno), errno);
-    }
-    else {
-	ret = inet_aifaddr(s, if_name(if_p), addr, &mask, &dest);
-	if (ret < 0) {
-	    ret = errno;
-	    my_log(LOG_NOTICE, "service_clat46_set_address(%s) "
-		   IP_FORMAT " inet_aifaddr() failed, %s (%d)",
-		   if_name(if_p),
-		   IP_LIST(&addr), strerror(errno), errno);
-	}
-	close(s);
-    }
-
-    flush_routes(if_link_index(if_p), G_ip_zeroes, dest);
-    return (ret);
-}
-
-PRIVATE_EXTERN int
-service_clat46_remove_address(ServiceRef service_p, struct in_addr addr)
-{
-    interface_t *	if_p = service_interface(service_p);
-    int			ret = 0;
-
-    if (addr.s_addr != 0) {
-	int	s;
-
-	my_log(LOG_NOTICE,
-	       "%s %s: removing " IP_FORMAT " dest " IP_FORMAT,
-	       ServiceGetMethodString(service_p),
-	       if_name(if_p),
-	       IP_LIST(&addr), IP_LIST(&addr));
-
-	s = inet_dgram_socket();
-	if (s < 0) {
-	    ret = errno;
-	    my_log(LOG_ERR,
-		   "service_clat46_remove_address(%s) socket() failed, %s (%d)",
-		   if_name(if_p), strerror(errno), errno);
-	}
-	else {
-	    if (inet_difaddr(s, if_name(if_p), addr) < 0) {
-		ret = errno;
-		my_log(LOG_NOTICE,
-		       "%s: failed to remove IP address " IP_FORMAT ", %s (%d)",
-		       if_name(if_p), IP_LIST(&addr), strerror(errno), errno);
-	    }
-	    close(s);
-	    flush_routes(if_link_index(if_p), addr, G_ip_zeroes);
-	}
-    }
-    return (ret);
 }
 
 /**
@@ -4511,6 +4402,14 @@ service_router_set_all_valid(ServiceRef service_p)
 	v4_p->router.flags = RIFLAGS_ALL_VALID;
     }
     return;
+}
+
+PRIVATE_EXTERN CFStringRef
+ServiceGetInterfaceName(ServiceRef service_p)
+{
+    IFStateRef		ifstate = service_ifstate(service_p);
+
+    return (ifstate->ifname);
 }
 
 PRIVATE_EXTERN boolean_t
@@ -5339,6 +5238,7 @@ add_or_set_service(const char * name, ipconfig_method_info_t info,
     boolean_t		clear_state = FALSE;
     boolean_t		enable_dad = TRUE;
     boolean_t		enable_clat46 = FALSE;
+    boolean_t		enable_clat46_specified = FALSE;
     interface_t * 	if_p = ifl_find_name(S_interfaces, name);
     IFStateRef   	ifstate;
     unsigned int	in_length;
@@ -5417,6 +5317,11 @@ add_or_set_service(const char * name, ipconfig_method_info_t info,
 		= S_get_plist_boolean_quiet(options_dict,
 					    _kIPConfigurationServiceOptionEnableCLAT46,
 					    FALSE);
+	    if (CFDictionaryContainsKey(options_dict, 
+					_kIPConfigurationServiceOptionEnableCLAT46)) {
+		enable_clat46_specified = TRUE;
+	    }
+
 	    prop_serviceID
 		= CFDictionaryGetValue(options_dict,
 				       _kIPConfigurationServiceOptionServiceID);
@@ -5434,7 +5339,8 @@ add_or_set_service(const char * name, ipconfig_method_info_t info,
 	}
     }
 
-    if (S_cellular_clat46_autoenable
+    if (!enable_clat46_specified
+	&& S_cellular_clat46_autoenable
 	&& (if_ift_type(if_p) == IFT_CELLULAR)
 	&& no_publish) {
 	my_log(LOG_INFO, "[DEBUG] auto-enabling clat46 on %s", name);
@@ -5458,7 +5364,6 @@ add_or_set_service(const char * name, ipconfig_method_info_t info,
     }
     ifstate->disable_perform_nud = !perform_nud;
     ifstate->disable_dad = !enable_dad;
-    ifstate->enable_clat46 = enable_clat46;
     ifstate->nat64_prefix_available = FALSE;
     ifstate->plat_discovery_complete = FALSE;
     if (clear_state) {
@@ -5469,6 +5374,9 @@ add_or_set_service(const char * name, ipconfig_method_info_t info,
     init_handler = ^(ServiceRef service_p) {
 	service_p->no_publish = no_publish;
 	service_p->is_dynamic = TRUE;
+	if (enable_clat46) {
+	    service_enable_clat46(service_p);
+	}
     };
     status = IFState_service_add(ifstate, serviceID, info, NULL,
 				 init_handler, &service_p);
@@ -7122,13 +7030,13 @@ runloop_observer(CFRunLoopObserverRef observer,
 	service_order = S_copy_service_order(S_scd_session);
 	if (S_linklocal_needs_attention) {
 	    S_linklocal_needs_attention = FALSE;
-	    my_log(LOG_INFO, "runloop_observer: calling S_linklocal_elect");
+	    my_log(LOG_DEBUG, "runloop_observer: calling S_linklocal_elect");
 	    S_linklocal_elect(service_order);
 	}
 
 	if (S_disable_until_needed_needs_attention) {
 	    S_disable_until_needed_needs_attention = FALSE;
-	    my_log(LOG_INFO,
+	    my_log(LOG_DEBUG,
 		   "runloop_observer: calling DisableUntilNeededProcess");
 	    DisableUntilNeededProcess(&S_ifstate_list, service_order);
 	}
@@ -7332,7 +7240,7 @@ power_notification_init()
     return (power_connection);
 }
 
-#if ! TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
 #define POWER_INTEREST	(kIOPMEarlyWakeNotification	\
 			 | kIOPMCapabilityNetwork	\
 			 | kIOPMCapabilityCPU)
@@ -7416,7 +7324,7 @@ new_power_notification_init(void)
     return;
 }
 
-#endif /* ! TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
 
 static boolean_t
 start_initialization(SCDynamicStoreRef session)
@@ -7454,16 +7362,16 @@ start_initialization(SCDynamicStoreRef session)
     configure_from_cache(session);
 
     /* register for sleep/wake */
-#if ! TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
     if (S_use_maintenance_wake) {
 	new_power_notification_init();
     }
     else {
 	S_power_connection = power_notification_init();
     }
-#else /* ! TARGET_OS_EMBEDDED */
+#else /* TARGET_OS_OSX */
     S_power_connection = power_notification_init();
-#endif /* ! TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
     return (TRUE);
 }
 
@@ -7617,7 +7525,7 @@ process_plat_discovery_complete(SCDynamicStoreRef session,
 	return;
     }
     ifstate = IFStateListGetIFState(&S_ifstate_list, ifn_cf, NULL);
-    if (ifstate != NULL && ifstate->enable_clat46) {
+    if (ifstate != NULL) {
 	boolean_t	success;
 
 	/* we're successful if the interface has prefixes */
@@ -7660,8 +7568,10 @@ S_copy_ssid_bssid(IFStateRef ifstate, struct ether_addr * ap_mac)
 	goto done;
     }
     ssid = CFDataCreateMutable(kCFAllocatorDefault, 0);
-    if (Apple80211Get((Apple80211Ref)wref, APPLE80211_IOC_SSID, 0, 
-		      ssid, 0) == kA11NoErr) {
+    if ((Apple80211Get(wref, APPLE80211_IOC_SSID, 0, ssid, 0) == kA11NoErr)
+	&& (Apple80211Get(wref, APPLE80211_IOC_BSSID, 0,
+			  ap_mac, sizeof(*ap_mac)) == kA11NoErr)) {
+	/* we have both the SSID and BSSID */
 	ssid_str = CFStringCreateWithBytes(NULL,
 					   CFDataGetBytePtr(ssid),
 					   CFDataGetLength(ssid),
@@ -7676,8 +7586,6 @@ S_copy_ssid_bssid(IFStateRef ifstate, struct ether_addr * ap_mac)
 	}
     }
     CFRelease(ssid);
-    (void)Apple80211Get((Apple80211Ref)wref, APPLE80211_IOC_BSSID, 0, 
-			ap_mac, sizeof(*ap_mac));
 
  done:
     if (wref != NULL) {
@@ -7699,7 +7607,7 @@ S_copy_ssid_bssid(IFStateRef ifstate, struct ether_addr * ap_mac)
 #else /* NO_WIRELESS */
 
 static CFStringRef
-S_copy_ssid_bssid(CFStringRef ifname, struct ether_addr * ap_mac)
+S_copy_ssid_bssid(IFStateRef ifstate, struct ether_addr * ap_mac)
 {
     return (NULL);
 }
@@ -8116,7 +8024,7 @@ handle_change(SCDynamicStoreRef session, CFArrayRef changes, void * arg)
     return;
 }
 
-#if ! TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
 
 static void
 user_confirm(CFUserNotificationRef userNotification, 
@@ -8296,7 +8204,7 @@ ServiceReportIPv6AddressConflict(ServiceRef service_p,
     return;
 }
 
-#endif /* TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
 
 PRIVATE_EXTERN CFStringRef
 ServiceCopyWakeID(ServiceRef service_p)
@@ -8673,12 +8581,12 @@ S_set_globals(void)
 	= S_get_plist_int(plist,
 			  CFSTR("WakeSkewSeconds"),
 			  WAKE_SKEW_SECS);
-#if ! TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
     S_use_maintenance_wake
 	= S_get_plist_boolean(plist,
 			      CFSTR("UseMaintenanceWake"),
 			      TRUE);
-#endif /* ! TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
     S_configure_ipv6 = S_get_plist_boolean(plist,
 					   CFSTR("ConfigureIPv6"),
 					   TRUE);
